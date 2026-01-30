@@ -1,0 +1,11 @@
+[Unit]
+Description=Aorus WaterForce 360 cooler HID updater for Linux
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/AorusWaterForce360-linux
+Restart=on-failure
+Type=simple
+
+[Install]
+WantedBy=multi-user.target
