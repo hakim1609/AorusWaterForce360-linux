@@ -1,0 +1,39 @@
+#!/bin/sh
+# Root helper for the WaterForce 360 UI, called through pkexec.
+# Only manages the display service and its two settings; every argument is validated.
+set -eu
+
+UNIT=AorusWaterForce360-linux
+DROPIN_DIR=/etc/systemd/system/$UNIT.service.d
+
+case "${1:-}" in
+	start | stop | restart)
+		systemctl "$1" "$UNIT"
+		;;
+	enable | disable)
+		systemctl "$1" "$UNIT"
+		;;
+	apply)
+		sensor=${2:-}
+		interval=${3:-}
+		fan_rpm=${4:-0}
+		pump_rpm=${5:-0}
+		echo "$sensor" | grep -Eqx '[A-Za-z0-9]{1,16}' || { echo "bad sensor: $sensor" >&2; exit 2; }
+		echo "$interval" | grep -Eqx '[1-9]|[1-5][0-9]|60' || { echo "bad interval: $interval" >&2; exit 2; }
+		# 0 = auto, otherwise 750..2750 RPM
+		echo "$fan_rpm" | grep -Eqx '0|[7-9][0-9]{2}|1[0-9]{3}|2[0-6][0-9]{2}|27[0-4][0-9]|2750' || { echo "bad fan rpm: $fan_rpm" >&2; exit 2; }
+		[ "$fan_rpm" = 0 ] || [ "$fan_rpm" -ge 750 ] || { echo "bad fan rpm: $fan_rpm" >&2; exit 2; }
+		# 0 = auto, otherwise 1600..3200 RPM
+		echo "$pump_rpm" | grep -Eqx '0|1[6-9][0-9]{2}|2[0-9]{3}|3[01][0-9]{2}|3200' || { echo "bad pump rpm: $pump_rpm" >&2; exit 2; }
+		mkdir -p "$DROPIN_DIR"
+		printf '[Service]\nEnvironment=AWF_SENSOR=%s AWF_INTERVAL=%s AWF_FAN_RPM=%s AWF_PUMP_RPM=%s\n' \
+			"$sensor" "$interval" "$fan_rpm" "$pump_rpm" >"$DROPIN_DIR/ui.conf"
+		systemctl daemon-reload
+		# restart only a running service, so "apply" never turns the display on by itself
+		systemctl try-restart "$UNIT"
+		;;
+	*)
+		echo "usage: $0 start|stop|restart|enable|disable|apply <sensor> <interval-sec> [fan-rpm|0] [pump-rpm|0]" >&2
+		exit 2
+		;;
+esac
