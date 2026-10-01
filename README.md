@@ -44,6 +44,10 @@ and cooler readings and sets fan and pump speed.
     switching manual off returns the cooler to its factory profile
   * **Cooler display**: start/stop the service, start on boot, which CPU sensor to show
     (`Tccd1`, `Tctl`, …) and the refresh interval
+  * **Top bar**: CPU temperature in the GNOME top bar, colored green → yellow → red by heat
+    (GNOME Shell 45+ extension `awf360-temp@fourgl.github.com`, turned on/off from the panel;
+    click it to open the panel). On Wayland, log out and back in once after the first install
+    so GNOME Shell picks the extension up.
 
   Settings are stored as a systemd drop-in
   (`/etc/systemd/system/AorusWaterForce360-linux.service.d/ui.conf`):

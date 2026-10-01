@@ -19,6 +19,10 @@ install -m 644 ui/com.github.fourgl.awf360.policy /usr/share/polkit-1/actions/co
 install -m 755 ui/awf360-ui.py /usr/local/bin/awf360-ui
 install -D -m 644 ui/com.github.fourgl.awf360.desktop /usr/local/share/applications/com.github.fourgl.awf360.desktop
 install -D -m 644 ui/com.github.fourgl.awf360.svg /usr/local/share/icons/hicolor/scalable/apps/com.github.fourgl.awf360.svg
+# top bar temperature: GNOME Shell extension, turned on from the control panel
+EXT=awf360-temp@fourgl.github.com
+install -d /usr/local/share/gnome-shell/extensions/$EXT
+install -m 644 ui/gnome-extension/$EXT/* /usr/local/share/gnome-shell/extensions/$EXT/
 gtk-update-icon-cache -q -t /usr/local/share/icons/hicolor 2>/dev/null || true
 update-desktop-database -q /usr/local/share/applications 2>/dev/null || true
 

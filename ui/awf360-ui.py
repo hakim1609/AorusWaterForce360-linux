@@ -17,6 +17,7 @@ APP_ID = "com.github.fourgl.awf360"
 UNIT = "AorusWaterForce360-linux"
 CTL = "/usr/local/bin/awf360-ctl"
 USB_ID = ("1044", "7a4d")
+EXT_UUID = "awf360-temp@fourgl.github.com"
 DEFAULT_SENSOR, DEFAULT_INTERVAL = "Tccd1", 5
 HISTORY = 120  # seconds of graph
 # RPM ranges must match the daemon (main.go) and the root helper (awf360-ctl)
@@ -125,6 +126,50 @@ def service_config():
         except ValueError:
             cooling.append(0)
     return (sensor, interval), tuple(cooling)
+
+
+class TopBarExtension:
+    """The GNOME Shell extension that shows the CPU temperature in the top bar.
+
+    Turning it on/off edits org.gnome.shell enabled-extensions, which GNOME Shell watches;
+    whether the running Shell has loaded it comes from its Extensions D-Bus service."""
+
+    # ExtensionState in GNOME Shell 45+: 1 = active, 2 = inactive, 3 = error, 4 = out of date
+    ACTIVE, INACTIVE = 1, 2
+
+    def __init__(self):
+        source = Gio.SettingsSchemaSource.get_default()
+        self.settings = (Gio.Settings.new("org.gnome.shell")
+                         if source and source.lookup("org.gnome.shell", True) else None)
+
+    def installed(self):
+        dirs = [GLib.get_user_data_dir(), *GLib.get_system_data_dirs()]
+        return any(os.path.isfile(f"{d}/gnome-shell/extensions/{EXT_UUID}/metadata.json") for d in dirs)
+
+    def enabled(self):
+        return bool(self.settings) and EXT_UUID in self.settings.get_strv("enabled-extensions")
+
+    def set_enabled(self, on):
+        enabled = [u for u in self.settings.get_strv("enabled-extensions") if u != EXT_UUID]
+        disabled = [u for u in self.settings.get_strv("disabled-extensions") if u != EXT_UUID]
+        self.settings.set_strv("enabled-extensions", enabled + [EXT_UUID] if on else enabled)
+        self.settings.set_strv("disabled-extensions", disabled if on else disabled + [EXT_UUID])
+        Gio.Settings.sync()
+
+    def user_extensions_off(self):
+        return bool(self.settings) and self.settings.get_boolean("disable-user-extensions")
+
+    def shell_state(self):
+        """State in the running Shell, or None when it has not loaded the extension (or no Shell)."""
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            info = bus.call_sync("org.gnome.Shell.Extensions", "/org/gnome/Shell/Extensions",
+                                 "org.gnome.Shell.Extensions", "GetExtensionInfo",
+                                 GLib.Variant("(s)", (EXT_UUID,)), GLib.VariantType("(a{sv})"),
+                                 Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
+        except GLib.Error:
+            return None
+        return int(info["state"]) if "state" in info else None
 
 
 # ---------- UI ----------
@@ -378,6 +423,16 @@ class Window(Adw.ApplicationWindow):
         group.add(self.interval_row)
         box.append(group)
 
+        # GNOME top bar indicator (a Shell extension)
+        self.topbar = TopBarExtension()
+        topbar_group = Adw.PreferencesGroup(title="Top bar")
+        self.topbar_row = Adw.SwitchRow(title="CPU temperature in the top bar")
+        self.topbar_row.connect("notify::active", self.on_topbar_toggled)
+        topbar_group.add(self.topbar_row)
+        box.append(topbar_group)
+        if self.topbar.settings:
+            self.topbar.settings.connect("changed::enabled-extensions", lambda *_: self.sync_topbar())
+
         self.tick()
         self.poll_service()
         GLib.timeout_add_seconds(1, self.tick)
@@ -430,7 +485,32 @@ class Window(Adw.ApplicationWindow):
             "activating": "Starting…",
         }.get(active, active))
         self.poll_cooler()
+        self.sync_topbar()
         return True
+
+    def sync_topbar(self):
+        ext = self.topbar
+        self.syncing = True
+        self.topbar_row.set_active(ext.enabled())
+        self.syncing = False
+        state = ext.shell_state() if ext.settings else None
+        if not ext.settings:
+            subtitle, usable = "Needs GNOME Shell", False
+        elif not ext.installed():
+            subtitle, usable = "Extension not installed: run ui/install.sh", False
+        elif ext.user_extensions_off():
+            subtitle, usable = "Extensions are turned off in GNOME (Extensions app)", True
+        elif state is None:
+            subtitle, usable = "Log out and back in once so GNOME Shell loads the extension", True
+        elif state == ext.ACTIVE:
+            subtitle, usable = "Green to red by heat, same sensor as the display. Click it to open this window", True
+        elif state == ext.INACTIVE:
+            subtitle, usable = "Colored from green to red by heat, same sensor as the display", True
+        else:
+            subtitle, usable = "The extension failed to load: see journalctl --user -b | grep awf360", True
+        self.topbar_row.set_subtitle(subtitle)
+        self.topbar_row.set_sensitive(usable)
+        return False
 
     def poll_cooler(self):
         if self.cooler_polling:
@@ -493,6 +573,11 @@ class Window(Adw.ApplicationWindow):
                 self.toast(f"Fan {fan}, pump {pump}")
 
         self.ctl(["apply", sensor, str(interval), *map(str, wanted)], done)
+
+    def on_topbar_toggled(self, row, _pspec):
+        if not self.syncing and row.get_active() != self.topbar.enabled():
+            self.topbar.set_enabled(row.get_active())
+            GLib.timeout_add(500, self.sync_topbar)  # the Shell needs a moment to (un)load it
 
     def on_run_toggled(self, row, _pspec):
         if not self.syncing:
