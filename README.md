@@ -11,6 +11,8 @@ and cooler readings and sets fan and pump speed.
 
 ![WaterForce 360 control panel](docs/screenshot.png)
 
+![CPU temperature in the GNOME top bar](docs/topbar.png)
+
 ## Dependencies:
   * Build: Go 1.20+ (no cgo, no third-party modules — the daemon writes to `/dev/hidraw` directly)
   * Control panel: Python 3, PyGObject, GTK 4, libadwaita, polkit
@@ -40,8 +42,11 @@ and cooler readings and sets fan and pump speed.
   * **CPU**: temperature of the sensor sent to the display, frequency, load, a 2-minute graph,
     all `k10temp`/`coretemp` sensors
   * **Cooler**: fan and pump RPM, duty and coolant temperature from the kernel driver
-  * **Cooling control**: manual fan speed (750–2750 RPM) and pump speed (1600–3200 RPM);
-    switching manual off returns the cooler to its factory profile
+  * **Cooling control**, separately for the fan and the pump:
+    * *Factory profile*: the cooler's own setting
+    * *Fixed speed*: fan 750–2750 RPM, pump 1600–3200 RPM
+    * *Curve*: four draggable points, CPU temperature → RPM. The cooler follows the curve on
+      its own, interpolating linearly, by the CPU temperature the daemon sends for the LCD
   * **Cooler display**: start/stop the service, start on boot, which CPU sensor to show
     (`Tccd1`, `Tctl`, …) and the refresh interval
   * **Top bar**: CPU temperature in the GNOME top bar, colored green → yellow → red by heat
@@ -51,7 +56,8 @@ and cooler readings and sets fan and pump speed.
 
   Settings are stored as a systemd drop-in
   (`/etc/systemd/system/AorusWaterForce360-linux.service.d/ui.conf`):
-  `AWF_SENSOR`, `AWF_INTERVAL`, `AWF_FAN_RPM`, `AWF_PUMP_RPM` (0 = factory profile).
+  `AWF_SENSOR`, `AWF_INTERVAL`, and per channel `AWF_FAN_MODE` / `AWF_PUMP_MODE`
+  (`factory`, `fixed`, `curve`), `AWF_*_RPM` and `AWF_*_CURVE` (`temp:rpm,…`, 4 points).
   The panel changes them through `pkexec awf360-ctl`, which validates every value.
   The polkit policy lets the active local session do this without a password; change
   `allow_active` to `auth_admin_keep` in `ui/com.github.fourgl.awf360.policy` to require one.
@@ -67,8 +73,9 @@ and cooler readings and sets fan and pump speed.
   | `99 E6 01 01` + 4 × `[temp °C][RPM be16]` | fan curve |
   | `99 E6 04 02` + 4 × `[temp °C][RPM be16]` | pump curve |
 
-  The daemon sends a flat curve (same RPM at every point) once when it starts. The
-  cooler stores profiles and curves itself, so they are not re-sent every cycle.
+  The cooler follows a curve by the CPU temperature in the `E0` LCD report, interpolating
+  linearly between points; a fixed speed is a flat curve. The daemon sends profiles and
+  curves once when it starts: the cooler stores them itself, so they are not re-sent every cycle.
   The fan/pump commands are reverse-engineered and were verified on a WATERFORCE 360
   (`1044:7a4d`) by setting speeds and reading the real RPM back from the kernel driver.
   Curve layout: Aleksa Savic's pre-mainline

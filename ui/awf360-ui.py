@@ -22,6 +22,12 @@ DEFAULT_SENSOR, DEFAULT_INTERVAL = "Tccd1", 5
 HISTORY = 120  # seconds of graph
 # RPM ranges must match the daemon (main.go) and the root helper (awf360-ctl)
 FAN_RANGE, PUMP_RANGE, RPM_STEP = (750, 2750), (1600, 3200), 50
+MODES = [("factory", "Factory profile"), ("fixed", "Fixed speed"), ("curve", "Curve")]
+DEFAULT_CURVES = {
+    "fan": ((30, 800), (50, 1200), (70, 2000), (85, 2750)),
+    "pump": ((30, 1800), (50, 2200), (70, 2800), (85, 3200)),
+}
+CURVE_TEMPS = (20, 100)  # °C shown on the curve editor's x axis
 
 
 # ---------- system readers (no root needed) ----------
@@ -119,13 +125,51 @@ def service_config():
         interval = int(env.get("AWF_INTERVAL", DEFAULT_INTERVAL))
     except ValueError:
         interval = DEFAULT_INTERVAL
-    cooling = []
-    for name in ("AWF_FAN_RPM", "AWF_PUMP_RPM"):
-        try:
-            cooling.append(int(env.get(name, 0)))
-        except ValueError:
-            cooling.append(0)
-    return (sensor, interval), tuple(cooling)
+    fan = channel_config(env, "fan", FAN_RANGE)
+    pump = channel_config(env, "pump", PUMP_RANGE)
+    return (sensor, interval), (fan, pump)
+
+
+def format_curve(curve):
+    return ",".join(f"{t}:{r}" for t, r in curve)
+
+
+def parse_curve(text, rpm_range):
+    """4 "temp:rpm" points, temperatures 0..100 strictly rising, RPM in range — as the daemon checks."""
+    try:
+        curve = tuple(tuple(int(v) for v in point.split(":")) for point in text.split(","))
+    except ValueError:
+        return None
+    lo, hi = rpm_range
+    if len(curve) != 4 or any(len(p) != 2 or not 0 <= p[0] <= 100 or not lo <= p[1] <= hi for p in curve):
+        return None
+    if any(a[0] >= b[0] for a, b in zip(curve, curve[1:])):
+        return None
+    return curve
+
+
+def channel_config(env, name, rpm_range):
+    """(mode, fixed rpm, curve) of one channel from the drop-in; older drop-ins only have the RPM."""
+    prefix = f"AWF_{name.upper()}"
+    lo, hi = rpm_range
+    try:
+        rpm = int(env.get(f"{prefix}_RPM", 0))
+    except ValueError:
+        rpm = 0
+    mode = env.get(f"{prefix}_MODE") or ("fixed" if rpm else "factory")
+    curve = parse_curve(env.get(f"{prefix}_CURVE", ""), rpm_range) or DEFAULT_CURVES[name]
+    if not lo <= rpm <= hi:
+        rpm = (lo + hi) // 2
+    return mode, rpm, curve
+
+
+def describe(cfg):
+    mode, rpm, curve = cfg
+    if mode == "fixed":
+        return f"{rpm} RPM"
+    if mode == "curve":
+        return f"curve {curve[0][1]}–{curve[-1][1]} RPM"
+    return "factory profile"
 
 
 class TopBarExtension:
@@ -193,16 +237,219 @@ class StatCard(Gtk.Box):
             self.value.add_css_class(level)
 
 
-class SpeedControl:
-    """"Manual <x> speed" switch plus an RPM slider; 0 RPM means the cooler's own profile."""
+class CurveEditor(Gtk.DrawingArea):
+    """4-point fan/pump curve: CPU temperature (x) -> RPM (y). Drag a point to move it."""
 
-    def __init__(self, group, name, rpm_range, rpm, on_change):
-        lo, hi = rpm_range
+    PAD_L, PAD_R, PAD_T, PAD_B = 46, 14, 14, 26
+    HIT = 18  # px around a point that grabs it
+
+    def __init__(self, rpm_range, curve, on_change):
+        super().__init__()
+        self.lo, self.hi = rpm_range
+        self.points = [list(p) for p in curve]
         self.on_change = on_change
-        self.switch = Adw.SwitchRow(title=f"Manual {name.lower()} speed", active=rpm > 0)
-        group.add(self.switch)
+        self.current_temp = None
+        self.active = None
+        self.hover = None
+        self.set_content_height(230)
+        self.set_hexpand(True)
+        self.set_draw_func(self.draw)
 
-        row = Gtk.ListBoxRow(activatable=False)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.on_drag_begin)
+        drag.connect("drag-update", self.on_drag_update)
+        drag.connect("drag-end", self.on_drag_end)
+        self.add_controller(drag)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self.on_motion)
+        motion.connect("leave", lambda *_: self.set_hover(None))
+        self.add_controller(motion)
+
+    def curve(self):
+        return tuple(tuple(p) for p in self.points)
+
+    # --- geometry ---
+
+    def plot_size(self):
+        return (self.get_width() - self.PAD_L - self.PAD_R, self.get_height() - self.PAD_T - self.PAD_B)
+
+    def to_xy(self, temp, rpm):
+        w, h = self.plot_size()
+        t0, t1 = CURVE_TEMPS
+        x = self.PAD_L + w * (min(max(temp, t0), t1) - t0) / (t1 - t0)
+        y = self.PAD_T + h * (1 - (rpm - self.lo) / (self.hi - self.lo))
+        return x, y
+
+    def from_xy(self, x, y):
+        w, h = self.plot_size()
+        t0, t1 = CURVE_TEMPS
+        temp = t0 + (x - self.PAD_L) / w * (t1 - t0)
+        rpm = self.lo + (1 - (y - self.PAD_T) / h) * (self.hi - self.lo)
+        return temp, rpm
+
+    def rpm_at(self, temp):
+        """RPM the cooler targets at this temperature: linear between points, flat outside."""
+        pts = self.points
+        if temp <= pts[0][0]:
+            return pts[0][1]
+        for (ta, ra), (tb, rb) in zip(pts, pts[1:]):
+            if temp <= tb:
+                return ra + (rb - ra) * (temp - ta) / (tb - ta)
+        return pts[-1][1]
+
+    def nearest(self, x, y):
+        best, best_d = None, self.HIT
+        for i, (t, r) in enumerate(self.points):
+            px, py = self.to_xy(t, r)
+            d = ((px - x) ** 2 + (py - y) ** 2) ** 0.5
+            if d <= best_d:
+                best, best_d = i, d
+        return best
+
+    # --- drawing ---
+
+    def draw(self, _area, cr, width, height):
+        fg = self.get_color()
+        accent = Adw.StyleManager.get_default().get_accent_color_rgba()
+        w, h = self.plot_size()
+        t0, t1 = CURVE_TEMPS
+        cr.set_font_size(10.5)
+        cr.set_line_width(1)
+
+        for t in range(t0, t1 + 1, 10):  # temperature grid
+            x, _ = self.to_xy(t, self.lo)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.10)
+            cr.move_to(x, self.PAD_T)
+            cr.line_to(x, self.PAD_T + h)
+            cr.stroke()
+            if t % 20 == 0:
+                label = f"{t}°C"
+                ext = cr.text_extents(label)
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.6)
+                cr.move_to(x - ext.width / 2, height - 8)
+                cr.show_text(label)
+        step = 500
+        for rpm in range((self.lo + step - 1) // step * step, self.hi + 1, step):  # RPM grid
+            _, y = self.to_xy(t0, rpm)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.10)
+            cr.move_to(self.PAD_L, y)
+            cr.line_to(self.PAD_L + w, y)
+            cr.stroke()
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.6)
+            ext = cr.text_extents(str(rpm))
+            cr.move_to(self.PAD_L - 6 - ext.width, y + 4)
+            cr.show_text(str(rpm))
+
+        # the curve, flat before the first and after the last point
+        line = [self.to_xy(t0, self.points[0][1])] + [self.to_xy(t, r) for t, r in self.points] \
+            + [self.to_xy(t1, self.points[-1][1])]
+        cr.move_to(line[0][0], self.PAD_T + h)
+        for x, y in line:
+            cr.line_to(x, y)
+        cr.line_to(line[-1][0], self.PAD_T + h)
+        cr.close_path()
+        cr.set_source_rgba(accent.red, accent.green, accent.blue, 0.12)
+        cr.fill()
+        cr.set_line_width(2)
+        cr.set_source_rgba(accent.red, accent.green, accent.blue, 1)
+        cr.move_to(*line[0])
+        for x, y in line[1:]:
+            cr.line_to(x, y)
+        cr.stroke()
+
+        # where the cooler is now: current CPU temperature on the curve
+        if self.current_temp is not None:
+            temp = self.current_temp
+            x, y = self.to_xy(temp, self.rpm_at(temp))
+            cr.set_line_width(1)
+            cr.set_dash([4, 4])
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.45)
+            cr.move_to(x, self.PAD_T)
+            cr.line_to(x, self.PAD_T + h)
+            cr.stroke()
+            cr.set_dash([])
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.9)
+            cr.arc(x, y, 4, 0, 6.2832)
+            cr.fill()
+            label = f"now {temp:.0f}°C · {self.rpm_at(temp):.0f} RPM"
+            ext = cr.text_extents(label)
+            lx = min(max(x + 6, self.PAD_L + 4), self.PAD_L + w - ext.width - 4)
+            cr.move_to(lx, self.PAD_T + 12)
+            cr.show_text(label)
+
+        for i, (t, r) in enumerate(self.points):
+            x, y = self.to_xy(t, r)
+            big = i in (self.active, self.hover)
+            cr.set_source_rgba(accent.red, accent.green, accent.blue, 1)
+            cr.arc(x, y, 8 if big else 6, 0, 6.2832)
+            cr.fill()
+            cr.set_source_rgba(1, 1, 1, 0.9)
+            cr.arc(x, y, 2.5, 0, 6.2832)
+            cr.fill()
+            if big:
+                label = f"{t}°C · {r} RPM"
+                ext = cr.text_extents(label)
+                lx = min(max(x - ext.width / 2, self.PAD_L), self.PAD_L + w - ext.width)
+                ly = y - 14 if y - 14 > self.PAD_T + 24 else y + 24
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 1)
+                cr.move_to(lx, ly)
+                cr.show_text(label)
+
+    # --- interaction ---
+
+    def set_hover(self, idx):
+        if idx != self.hover:
+            self.hover = idx
+            self.set_cursor_from_name("grab" if idx is not None else None)
+            self.queue_draw()
+
+    def on_motion(self, _ctl, x, y):
+        if self.active is None:
+            self.set_hover(self.nearest(x, y))
+
+    def on_drag_begin(self, gesture, x, y):
+        self.active = self.nearest(x, y)
+        if self.active is None:
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
+        self.drag_start = self.to_xy(*self.points[self.active])
+        self.before = self.curve()
+        self.set_cursor_from_name("grabbing")
+
+    def on_drag_update(self, _gesture, dx, dy):
+        if self.active is None:
+            return
+        i = self.active
+        temp, rpm = self.from_xy(self.drag_start[0] + dx, self.drag_start[1] + dy)
+        # keep temperatures rising: at least 1 °C between neighbours
+        t_min = self.points[i - 1][0] + 1 if i > 0 else CURVE_TEMPS[0]
+        t_max = self.points[i + 1][0] - 1 if i < len(self.points) - 1 else CURVE_TEMPS[1]
+        self.points[i] = [int(min(max(round(temp), t_min), t_max)),
+                          int(min(max(round(rpm / RPM_STEP) * RPM_STEP, self.lo), self.hi))]
+        self.queue_draw()
+
+    def on_drag_end(self, _gesture, _dx, _dy):
+        if self.active is None:
+            return
+        self.active = None
+        self.set_cursor_from_name("grab")
+        self.queue_draw()
+        if self.curve() != self.before:
+            self.on_change()
+
+
+class CoolingControl:
+    """Mode (factory / fixed / curve) of one channel, with an RPM slider and a curve editor."""
+
+    def __init__(self, group, name, rpm_range, cfg, on_change):
+        lo, hi = rpm_range
+        mode, rpm, curve = cfg
+        self.on_change = on_change
+        self.mode_row = Adw.ComboRow(title=f"{name} mode", model=Gtk.StringList.new([t for _, t in MODES]))
+        self.mode_row.set_selected(next((i for i, (k, _) in enumerate(MODES) if k == mode), 0))
+        group.add(self.mode_row)
+
+        self.fixed_row = Gtk.ListBoxRow(activatable=False)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
                       margin_top=10, margin_bottom=6, margin_start=12, margin_end=12)
         head = Gtk.Box()
@@ -214,25 +461,43 @@ class SpeedControl:
         self.scale.set_draw_value(False)
         for mark in (lo, (lo + hi) // 2, hi):
             self.scale.add_mark(mark, Gtk.PositionType.BOTTOM, f"{mark}")
-        self.scale.set_value(rpm or (lo + hi) // 2)
+        self.scale.set_value(rpm)
         box.append(self.scale)
-        row.set_child(box)
-        group.add(row)
+        self.fixed_row.set_child(box)
+        group.add(self.fixed_row)
+
+        self.curve_row = Gtk.ListBoxRow(activatable=False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                      margin_top=10, margin_bottom=10, margin_start=12, margin_end=12)
+        box.append(Gtk.Label(label=f"{name} curve", xalign=0))
+        self.hint = Gtk.Label(xalign=0, wrap=True, css_classes=["dim-label", "caption"])
+        box.append(self.hint)
+        self.editor = CurveEditor(rpm_range, curve, self.changed_now)
+        box.append(self.editor)
+        self.curve_row.set_child(box)
+        group.add(self.curve_row)
 
         self.timer = 0
         self.refresh()
-        self.switch.connect("notify::active", self.changed_now)
+        self.mode_row.connect("notify::selected", self.changed_now)
         self.scale.connect("value-changed", self.changed_later)
 
-    def rpm(self):
-        """Selected RPM, or 0 when the switch is off."""
-        if not self.switch.get_active():
-            return 0
-        return int(round(self.scale.get_value() / RPM_STEP) * RPM_STEP)
+    def mode(self):
+        return MODES[self.mode_row.get_selected()][0]
+
+    def config(self):
+        return (self.mode(), int(round(self.scale.get_value() / RPM_STEP) * RPM_STEP), self.editor.curve())
+
+    def set_current(self, temp, sensor):
+        self.editor.current_temp = temp
+        self.hint.set_label(f"CPU temperature ({sensor}) → RPM. The cooler follows the curve on its own, "
+                            "linearly between points. Drag a point to move it.")
+        self.editor.queue_draw()
 
     def refresh(self):
-        self.scale.set_sensitive(self.switch.get_active())
-        self.value.set_label(f"{self.rpm()} RPM" if self.rpm() else "Auto")
+        self.fixed_row.set_visible(self.mode() == "fixed")
+        self.curve_row.set_visible(self.mode() == "curve")
+        self.value.set_label(f"{self.config()[1]} RPM")
 
     def changed_now(self, *_):
         self.timer = 0
@@ -381,12 +646,13 @@ class Window(Adw.ApplicationWindow):
         # fan / pump speed, sent to the cooler by the display service when it starts
         control = Adw.PreferencesGroup(
             title="Cooling control",
-            description="Reverse-engineered commands, verified on this cooler. The display service "
-                        "sends them when it starts, so it has to be running. Auto returns the "
-                        "cooler to its factory profile. Check the Cooler readings above for the effect.")
-        fan_rpm, pump_rpm = self.cooling
-        self.fan = SpeedControl(control, "Fan", FAN_RANGE, fan_rpm, self.on_cooling_changed)
-        self.pump = SpeedControl(control, "Pump", PUMP_RANGE, pump_rpm, self.on_cooling_changed)
+            description="Factory profile: the cooler's own setting. Fixed speed: one RPM. Curve: the "
+                        "cooler changes speed itself by the CPU temperature the display service sends. "
+                        "Reverse-engineered commands, verified on this cooler; the service sends them "
+                        "when it starts, so it has to be running.")
+        fan_cfg, pump_cfg = self.cooling
+        self.fan = CoolingControl(control, "Fan", FAN_RANGE, fan_cfg, self.on_cooling_changed)
+        self.pump = CoolingControl(control, "Pump", PUMP_RANGE, pump_cfg, self.on_cooling_changed)
         box.append(control)
 
         # display service
@@ -463,6 +729,9 @@ class Window(Adw.ApplicationWindow):
         mhz = cpu_mhz()
         self.freq_card.value.set_label(f"{mhz / 1000:.1f} GHz")
         self.load_card.value.set_label(f"{load:.0f}%")
+
+        self.fan.set_current(temp, sensor)
+        self.pump.set_current(temp, sensor)
 
         self.temps.append(temp)
         self.loads.append(load)
@@ -558,10 +827,17 @@ class Window(Adw.ApplicationWindow):
                 self.on_setting_changed()
                 self.toast("Settings applied")
 
-        self.ctl(["apply", sensor, str(interval), *map(str, self.cooling)], done)
+        self.ctl(self.apply_args(sensor, interval, self.cooling), done)
+
+    @staticmethod
+    def apply_args(sensor, interval, cooling):
+        args = ["apply", sensor, str(interval)]
+        for mode, rpm, curve in cooling:
+            args += [mode, str(rpm), format_curve(curve)]
+        return args
 
     def on_cooling_changed(self):
-        wanted = (self.fan.rpm(), self.pump.rpm())
+        wanted = (self.fan.config(), self.pump.config())
         if wanted == self.cooling:
             return
         sensor, interval = self.applied
@@ -569,10 +845,9 @@ class Window(Adw.ApplicationWindow):
         def done(ok):
             if ok:
                 self.cooling = wanted
-                fan, pump = (f"{v} RPM" if v else "auto" for v in wanted)
-                self.toast(f"Fan {fan}, pump {pump}")
+                self.toast(f"Fan: {describe(wanted[0])}, pump: {describe(wanted[1])}")
 
-        self.ctl(["apply", sensor, str(interval), *map(str, wanted)], done)
+        self.ctl(self.apply_args(sensor, interval, wanted), done)
 
     def on_topbar_toggled(self, row, _pspec):
         if not self.syncing and row.get_active() != self.topbar.enabled():
